@@ -1,0 +1,17 @@
+{
+  "name": "discord-checkin-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "register-commands": "node register-commands.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.23.2",
+    "dotenv": "^16.6.1",
+    "luxon": "^3.7.2",
+    "sqlite": "^5.1.1",
+    "sqlite3": "^5.1.7"
+  }
+}
