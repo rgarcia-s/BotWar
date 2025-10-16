@@ -164,12 +164,29 @@ function makeCheckoutRowForUser(guildId, userId, label = '✅ Fazer Checkout') {
   return new ActionRowBuilder().addComponents(btn);
 }
 
-async function trySendCheckoutDM(member) {
+async function trySendCheckoutNotification(member) {
+  const guild = member.guild;
+  if (!guild) return false;
+
+  const channelId = Number(LOG_CHANNEL_ID);
+  if (!channelId) return false;
+
+  let channel = guild.channels.cache.get(channelId);
+  if (!channel) {
+    try {
+      channel = await guild.channels.fetch(channelId);
+    } catch {
+      return false;
+    }
+  }
+
+  if (!channel || channel.type !== ChannelType.GuildText) return false;
+
   try {
     const row = makeCheckoutRowForUser(member.guild.id, member.id);
-    await member.send({
+    await channel.send({
       content: [
-        '👋 **Check-in iniciado!**',
+        `👋 <@${member.id}> **Check-in iniciado!**`,
         'Quando completar o tempo necessario, clique abaixo para fazer checkout.',
         '_Se clicar antes, eu aviso quanto tempo falta._'
       ].join('\n'),
@@ -281,7 +298,7 @@ client.on(Events.VoiceStateUpdate, async (oldS, newS) => {
       if (row) await finishSession(row.id, nowISO());
       await startSession(guild.id, member, afterCh);
       await sendLog(guild, `🔁 **Troca de sala**: ${member} de <#${beforeCh}> para <#${afterCh}>`);
-      await trySendCheckoutDM(member);
+      await trySendCheckoutNotification(member);
 
       return;
     }
@@ -290,7 +307,7 @@ client.on(Events.VoiceStateUpdate, async (oldS, newS) => {
       if (row) await finishSession(row.id, nowISO());
       await startSession(guild.id, member, afterCh);
       await sendLog(guild, `🟢 **Check-in**: ${member} em <#${afterCh}>`);
-      await trySendCheckoutDM(member);
+      await trySendCheckoutNotification(member);
 
       return;
     }
