@@ -53,10 +53,10 @@ async function initDb() {
   await db.exec(`
     CREATE TABLE IF NOT EXISTS sessions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      guild_id INTEGER NOT NULL,
-      user_id INTEGER NOT NULL,
+      guild_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
       user_name TEXT NOT NULL,
-      channel_id INTEGER NOT NULL,
+      channel_id TEXT NOT NULL,
       checkin_at TEXT NOT NULL,
       checkout_at TEXT,
       duration_minutes INTEGER
@@ -65,13 +65,94 @@ async function initDb() {
   await db.exec(`
     CREATE TABLE IF NOT EXISTS tracked_channels (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      guild_id INTEGER NOT NULL,
-      channel_id INTEGER NOT NULL,
+      guild_id TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
       UNIQUE(guild_id, channel_id)
     );
   `);
+  await ensureSessionsIdsAreText();
+  await ensureTrackedChannelsIdsAreText();
   await db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_open ON sessions (guild_id, user_id, checkout_at);`);
   await db.exec(`CREATE INDEX IF NOT EXISTS idx_tracked_guild ON tracked_channels (guild_id);`);
+}
+
+async function ensureSessionsIdsAreText() {
+  const columns = await db.all(`PRAGMA table_info(sessions);`);
+  if (!columns.length) return;
+  const needsMigration = columns.some(col =>
+    ['guild_id', 'user_id', 'channel_id'].includes(col.name) && col.type.toUpperCase() !== 'TEXT'
+  );
+  if (!needsMigration) return;
+
+  await db.exec('BEGIN TRANSACTION;');
+  try {
+    await db.exec('ALTER TABLE sessions RENAME TO sessions_old;');
+    await db.exec(`
+      CREATE TABLE sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        user_name TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        checkin_at TEXT NOT NULL,
+        checkout_at TEXT,
+        duration_minutes INTEGER
+      );
+    `);
+    await db.exec(`
+      INSERT INTO sessions (id, guild_id, user_id, user_name, channel_id, checkin_at, checkout_at, duration_minutes)
+      SELECT id,
+             printf('%s', guild_id),
+             printf('%s', user_id),
+             user_name,
+             printf('%s', channel_id),
+             checkin_at,
+             checkout_at,
+             duration_minutes
+      FROM sessions_old;
+    `);
+    await db.exec('DROP TABLE sessions_old;');
+    await db.exec('COMMIT;');
+  } catch (err) {
+    await db.exec('ROLLBACK;');
+    console.error('Falha ao migrar tabela sessions para IDs em texto:', err);
+    throw err;
+  }
+}
+
+async function ensureTrackedChannelsIdsAreText() {
+  const columns = await db.all(`PRAGMA table_info(tracked_channels);`);
+  if (!columns.length) return;
+  const needsMigration = columns.some(col =>
+    ['guild_id', 'channel_id'].includes(col.name) && col.type.toUpperCase() !== 'TEXT'
+  );
+  if (!needsMigration) return;
+
+  await db.exec('BEGIN TRANSACTION;');
+  try {
+    await db.exec('ALTER TABLE tracked_channels RENAME TO tracked_channels_old;');
+    await db.exec(`
+      CREATE TABLE tracked_channels (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        UNIQUE(guild_id, channel_id)
+      );
+    `);
+    await db.exec(`
+      INSERT INTO tracked_channels (id, guild_id, channel_id)
+      SELECT id,
+             printf('%s', guild_id),
+             printf('%s', channel_id)
+      FROM tracked_channels_old;
+    `);
+    await db.exec('DROP TABLE tracked_channels_old;');
+    await db.exec('COMMIT;');
+  } catch (err) {
+    await db.exec('ROLLBACK;');
+    console.error('Falha ao migrar tabela tracked_channels para IDs em texto:', err);
+    throw err;
+  }
 }
 
 function nowISO() {
@@ -84,14 +165,20 @@ function toDT(iso) {
 async function getOpenSession(guildId, userId) {
   return db.get(
     `SELECT * FROM sessions WHERE guild_id=? AND user_id=? AND checkout_at IS NULL ORDER BY id DESC LIMIT 1`,
-    [guildId, userId]
+    [String(guildId), String(userId)]
   );
 }
 async function startSession(guildId, user, channelId) {
   await db.run(
     `INSERT INTO sessions (guild_id, user_id, user_name, channel_id, checkin_at)
      VALUES (?, ?, ?, ?, ?)`,
-    [guildId, user.id, `${user.displayName ?? user.user?.username}#${user.user?.discriminator ?? '0000'}`, channelId, nowISO()]
+    [
+      String(guildId),
+      String(user.id),
+      `${user.displayName ?? user.user?.username}#${user.user?.discriminator ?? '0000'}`,
+      String(channelId),
+      nowISO()
+    ]
   );
 }
 async function finishSession(sessionId, whenISO) {
@@ -122,28 +209,60 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
 // tracked channels
 async function listTrackedIds(guildId) {
-  const rows = await db.all(`SELECT channel_id FROM tracked_channels WHERE guild_id=?`, [guildId]);
-  return new Set(rows.map(r => r.channel_id));
+  const rows = await db.all(`SELECT channel_id FROM tracked_channels WHERE guild_id=?`, [String(guildId)]);
+  return new Set(rows.map(r => String(r.channel_id)));
 }
 async function isTracked(guildId, channelId) {
   if (!channelId) return false;
-  const row = await db.get(`SELECT 1 FROM tracked_channels WHERE guild_id=? AND channel_id=?`, [guildId, channelId]);
+  const row = await db.get(
+    `SELECT 1 FROM tracked_channels WHERE guild_id=? AND channel_id=?`,
+    [String(guildId), String(channelId)]
+  );
   return !!row;
 }
 async function addTracked(guildId, channelId) {
-  await db.run(`INSERT OR IGNORE INTO tracked_channels (guild_id, channel_id) VALUES (?,?)`, [guildId, channelId]);
+  await db.run(
+    `INSERT OR IGNORE INTO tracked_channels (guild_id, channel_id) VALUES (?,?)`,
+    [String(guildId), String(channelId)]
+  );
 }
 async function remTracked(guildId, channelId) {
-  await db.run(`DELETE FROM tracked_channels WHERE guild_id=? AND channel_id=?`, [guildId, channelId]);
+  await db.run(
+    `DELETE FROM tracked_channels WHERE guild_id=? AND channel_id=?`,
+    [String(guildId), String(channelId)]
+  );
 }
 
 // logging
+async function resolveLogChannel(guild) {
+  const id = LOG_CHANNEL_ID?.trim();
+  if (!id) return null;
+
+  let channel = guild.channels.cache.get(id);
+  if (!channel) {
+    try {
+      channel = await guild.channels.fetch(id);
+    } catch (err) {
+      console.error(`Falha ao buscar o canal de log (${id})`, err);
+      return null;
+    }
+  }
+
+  if (!channel || channel.type !== ChannelType.GuildText) {
+    console.error(`Canal de log (${id}) não é um canal de texto válido.`);
+    return null;
+  }
+
+  return channel;
+}
+
 async function sendLog(guild, text) {
-  const id = Number(LOG_CHANNEL_ID);
-  if (!id) return;
-  const ch = guild.channels.cache.get(id);
-  if (ch && ch.type === ChannelType.GuildText) {
-    try { await ch.send(text); } catch {}
+  const channel = await resolveLogChannel(guild);
+  if (!channel) return;
+  try {
+    await channel.send(text);
+  } catch (err) {
+    console.error('Falha ao enviar mensagem para o canal de log.', err);
   }
 }
 
@@ -164,19 +283,26 @@ function makeCheckoutRowForUser(guildId, userId, label = '✅ Fazer Checkout') {
   return new ActionRowBuilder().addComponents(btn);
 }
 
-async function trySendCheckoutDM(member) {
+async function trySendCheckoutNotification(member) {
+  const guild = member.guild;
+  if (!guild) return false;
+
+  const channel = await resolveLogChannel(guild);
+  if (!channel) return false;
+
   try {
     const row = makeCheckoutRowForUser(member.guild.id, member.id);
-    await member.send({
+    await channel.send({
       content: [
-        '👋 **Check-in iniciado!**',
+        `👋 <@${member.id}> **Check-in iniciado!**`,
         'Quando completar o tempo necessario, clique abaixo para fazer checkout.',
         '_Se clicar antes, eu aviso quanto tempo falta._'
       ].join('\n'),
       components: [row]
     });
     return true;
-  } catch {
+  } catch (err) {
+    console.error('Falha ao enviar notificação de checkout no canal de log.', err);
     return false;
   }
 }
@@ -281,7 +407,7 @@ client.on(Events.VoiceStateUpdate, async (oldS, newS) => {
       if (row) await finishSession(row.id, nowISO());
       await startSession(guild.id, member, afterCh);
       await sendLog(guild, `🔁 **Troca de sala**: ${member} de <#${beforeCh}> para <#${afterCh}>`);
-      await trySendCheckoutDM(member);
+      await trySendCheckoutNotification(member);
 
       return;
     }
@@ -290,7 +416,7 @@ client.on(Events.VoiceStateUpdate, async (oldS, newS) => {
       if (row) await finishSession(row.id, nowISO());
       await startSession(guild.id, member, afterCh);
       await sendLog(guild, `🟢 **Check-in**: ${member} em <#${afterCh}>`);
-      await trySendCheckoutDM(member);
+      await trySendCheckoutNotification(member);
 
       return;
     }
@@ -394,31 +520,33 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (name === 'canais_alvo') {
       const ids = await listTrackedIds(interaction.guildId);
-if (!ids.size) {
-  await interaction.reply({ content: 'ℹ️ Nenhuma sala rastreada.', ephemeral: true });
-  return;
-}
+      if (!ids.size) {
+        await interaction.reply({ content: 'ℹ️ Nenhuma sala rastreada.', ephemeral: true });
+        return;
+      }
 
-let linhas = [];
-for (const id of ids) {
-  let canal = interaction.guild.channels.cache.get(id);
-  if (!canal) {
-    try {
-      canal = await interaction.guild.channels.fetch(id);
-    } catch {}
-  }
-  if (canal && canal.type === ChannelType.GuildVoice) {
-    linhas.push(`• 🎧 ${canal.name}`);
-  } else {
-    linhas.push(`• ❓ desconhecido (ID: ${id})`);
-  }
-}
+      const linhas = [];
+      for (const id of ids) {
+        let canal = interaction.guild.channels.cache.get(id);
+        if (!canal) {
+          try {
+            canal = await interaction.guild.channels.fetch(id);
+          } catch (err) {
+            console.error(`Falha ao buscar canal ${id} listado em /canais_alvo`, err);
+          }
+        }
+        if (canal && canal.type === ChannelType.GuildVoice) {
+          linhas.push(`• 🎧 ${canal.name}`);
+        } else {
+          linhas.push(`• ❓ desconhecido (ID: ${id})`);
+        }
+      }
 
-await interaction.reply({
-  content: `🎯 **Salas rastreadas:**\n${linhas.join('\n')}`,
-  ephemeral: true
-});
-
+      await interaction.reply({
+        content: `🎯 **Salas rastreadas:**\n${linhas.join('\n')}`,
+        ephemeral: true
+      });
+      return;
     }
 
     if (name === 'status') {
