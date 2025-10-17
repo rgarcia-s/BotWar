@@ -20,12 +20,14 @@ DISCORD_TOKEN=your_bot_token_here
 GUILD_ID=optional_guild_id_for_fast_command_registration
 LOG_CHANNEL_ID=optional_text_channel_id_for_logs
 TIMEZONE=America/Sao_Paulo
+EVENT_MANAGER_ROLE_ID=role_id_autorizado_para_eventos
 ```
 
 - `DISCORD_TOKEN` é obrigatório tanto para o bot (`index.js`) quanto para o script de registro de comandos (`register-commands.js`).【F:index.js†L9-L17】【F:register-commands.js†L5-L13】
 - `GUILD_ID` (opcional) limita o registro dos comandos *slash* a um único servidor e faz com que novos comandos apareçam imediatamente.【F:register-commands.js†L69-L88】
 - `LOG_CHANNEL_ID` (opcional) permite que o bot envie logs de entrada/saída para um canal de texto.【F:index.js†L94-L105】
 - `TIMEZONE` ajusta os carimbos de data ao salvar check-ins; se omitido, o padrão é `America/Sao_Paulo`.【F:index.js†L9-L43】
+- `EVENT_MANAGER_ROLE_ID` (opcional) restringe os comandos de início/encerramento de eventos ao cargo informado; se ausente, a permissão padrão continua sendo **Gerenciar Servidor**.【F:index.js†L20-L63】【F:index.js†L500-L560】
 
 ## 4. Instale as dependências
 ```bash

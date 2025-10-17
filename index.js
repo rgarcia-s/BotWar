@@ -7,7 +7,8 @@ import { DateTime } from 'luxon';
 const {
   DISCORD_TOKEN,
   TIMEZONE = 'America/Sao_Paulo',
-  LOG_CHANNEL_ID = '0'
+  LOG_CHANNEL_ID = '0',
+  EVENT_MANAGER_ROLE_ID
 } = process.env;
 
 if (!DISCORD_TOKEN) {
@@ -28,6 +29,51 @@ function canSendDm(guildId, userId) {
 function markDmSent(guildId, userId) {
   lastDmAt.set(`${guildId}:${userId}`, new Date());
 }
+
+function memberHasRole(member, roleId) {
+  if (!member || !roleId) return false;
+  const targetId = String(roleId);
+  const roles = member.roles;
+  if (!roles) return false;
+  if (roles.cache && typeof roles.cache.has === 'function') {
+    return roles.cache.has(targetId);
+  }
+  if (typeof roles.has === 'function') {
+    try {
+      return roles.has(targetId);
+    } catch {
+      return false;
+    }
+  }
+  if (Array.isArray(roles)) {
+    return roles.includes(targetId);
+  }
+  return false;
+}
+
+async function ensureEventManagerPermission(interaction, actionDescription) {
+  const roleId = EVENT_MANAGER_ROLE_ID?.trim();
+  if (roleId) {
+    if (memberHasRole(interaction.member, roleId)) {
+      return true;
+    }
+    await interaction.reply({
+      content: `❌ Apenas membros com o cargo autorizado podem ${actionDescription}.`,
+      ephemeral: true
+    });
+    return false;
+  }
+  if (interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+    return true;
+  }
+  await interaction.reply({
+    content: '❌ Você precisa da permissão **Gerenciar Servidor**.',
+    ephemeral: true
+  });
+  return false;
+}
+
+const activeEvents = new Map(); // guildId -> { event: row, timer: Timeout | null }
 
 
 // ===== Client
@@ -70,10 +116,35 @@ async function initDb() {
       UNIQUE(guild_id, channel_id)
     );
   `);
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      guild_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      expected_end_at TEXT NOT NULL,
+      ended_at TEXT
+    );
+  `);
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS event_participations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_id INTEGER NOT NULL,
+      user_id TEXT NOT NULL,
+      user_name TEXT NOT NULL,
+      joined_at TEXT NOT NULL,
+      left_at TEXT,
+      duration_minutes INTEGER,
+      FOREIGN KEY(event_id) REFERENCES events(id) ON DELETE CASCADE
+    );
+  `);
   await ensureSessionsIdsAreText();
   await ensureTrackedChannelsIdsAreText();
   await db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_open ON sessions (guild_id, user_id, checkout_at);`);
   await db.exec(`CREATE INDEX IF NOT EXISTS idx_tracked_guild ON tracked_channels (guild_id);`);
+  await db.exec(`CREATE INDEX IF NOT EXISTS idx_events_guild_open ON events (guild_id, ended_at);`);
+  await db.exec(`CREATE INDEX IF NOT EXISTS idx_event_participations_event ON event_participations (event_id, user_id, left_at);`);
 }
 
 async function ensureSessionsIdsAreText() {
@@ -197,6 +268,279 @@ function elapsedMinutes(sessionRow) {
   return Math.floor(DateTime.now().setZone(TIMEZONE).diff(start, 'minutes').minutes);
 }
 
+// ===== Eventos (rastreamento temporário de sala)
+
+function guildKey(id) {
+  return String(id);
+}
+
+function displayNameForMember(member) {
+  return `${member.displayName ?? member.user?.username}#${member.user?.discriminator ?? '0000'}`;
+}
+
+function scheduleEventTimer(eventRow) {
+  const expected = DateTime.fromISO(eventRow.expected_end_at, { zone: TIMEZONE });
+  const now = DateTime.now().setZone(TIMEZONE);
+  const delayMs = Math.max(0, expected.diff(now, 'milliseconds').milliseconds);
+  return setTimeout(() => {
+    autoStopEvent(eventRow.guild_id).catch((err) => {
+      console.error('Falha ao encerrar evento automaticamente:', err);
+    });
+  }, delayMs);
+}
+
+function storeActiveEvent(eventRow) {
+  const key = guildKey(eventRow.guild_id);
+  const current = activeEvents.get(key);
+  if (current?.timer) {
+    clearTimeout(current.timer);
+  }
+  const timer = scheduleEventTimer(eventRow);
+  activeEvents.set(key, { event: eventRow, timer });
+}
+
+function getActiveEvent(guildId) {
+  const entry = activeEvents.get(guildKey(guildId));
+  return entry?.event ?? null;
+}
+
+async function createEvent(guildId, channelId, name, durationMinutes) {
+  const started = nowISO();
+  const expected = DateTime.now().setZone(TIMEZONE).plus({ minutes: durationMinutes }).toISO();
+  const result = await db.run(
+    `INSERT INTO events (guild_id, name, channel_id, started_at, expected_end_at) VALUES (?,?,?,?,?)`,
+    [guildKey(guildId), name, String(channelId), started, expected]
+  );
+  const row = await db.get(`SELECT * FROM events WHERE id=?`, [result.lastID]);
+  storeActiveEvent(row);
+  return row;
+}
+
+async function autoStopEvent(guildId) {
+  const key = guildKey(guildId);
+  const entry = activeEvents.get(key);
+  if (!entry) return null;
+  activeEvents.delete(key);
+  if (entry.timer) clearTimeout(entry.timer);
+  const endIso = entry.event.expected_end_at;
+  const finished = await finalizeEvent(entry.event, endIso);
+  let guild = null;
+  try {
+    guild = client.guilds.cache.get(key) ?? await client.guilds.fetch(key);
+  } catch (err) {
+    console.error('Falha ao obter guild ao encerrar evento automaticamente:', err);
+  }
+  if (guild) {
+    try {
+      await sendLog(guild, `⏹️ **Evento encerrado automaticamente** (${entry.event.id}): ${entry.event.name}`);
+    } catch (err) {
+      console.error('Falha ao notificar encerramento automático do evento:', err);
+    }
+    await sendEventDocToOwner(guild, finished);
+  }
+  return finished;
+}
+
+async function stopActiveEvent(guildId, endIso = nowISO()) {
+  const key = guildKey(guildId);
+  const entry = activeEvents.get(key);
+  if (!entry) return null;
+  activeEvents.delete(key);
+  if (entry.timer) clearTimeout(entry.timer);
+  return finalizeEvent(entry.event, endIso);
+}
+
+async function finalizeEvent(eventRow, endIso) {
+  const end = endIso ?? nowISO();
+  await db.run(`UPDATE events SET ended_at=? WHERE id=?`, [end, eventRow.id]);
+  const open = await db.all(
+    `SELECT id FROM event_participations WHERE event_id=? AND left_at IS NULL`,
+    [eventRow.id]
+  );
+  for (const row of open) {
+    await finishEventParticipation(row.id, end);
+  }
+  return { ...eventRow, ended_at: end };
+}
+
+async function getOpenEventParticipation(eventId, userId) {
+  return db.get(
+    `SELECT * FROM event_participations WHERE event_id=? AND user_id=? AND left_at IS NULL ORDER BY id DESC LIMIT 1`,
+    [eventId, guildKey(userId)]
+  );
+}
+
+async function startEventParticipation(eventRow, member) {
+  const existing = await getOpenEventParticipation(eventRow.id, member.id);
+  if (existing) return existing;
+  const joinedAt = nowISO();
+  await db.run(
+    `INSERT INTO event_participations (event_id, user_id, user_name, joined_at) VALUES (?,?,?,?)`,
+    [eventRow.id, guildKey(member.id), displayNameForMember(member), joinedAt]
+  );
+  return db.get(`SELECT * FROM event_participations WHERE event_id=? AND user_id=? AND joined_at=?`, [
+    eventRow.id,
+    guildKey(member.id),
+    joinedAt
+  ]);
+}
+
+async function finishEventParticipation(participationId, endIso) {
+  const row = await db.get(`SELECT joined_at FROM event_participations WHERE id=?`, [participationId]);
+  if (!row) return;
+  const start = toDT(row.joined_at);
+  const end = DateTime.fromISO(endIso, { zone: TIMEZONE });
+  const duration = Math.max(0, Math.round(end.diff(start, 'minutes').minutes));
+  await db.run(
+    `UPDATE event_participations SET left_at=?, duration_minutes=? WHERE id=?`,
+    [endIso, duration, participationId]
+  );
+}
+
+async function stopParticipationForMember(eventRow, member, endIso = nowISO()) {
+  const participation = await getOpenEventParticipation(eventRow.id, member.id);
+  if (!participation) return;
+  await finishEventParticipation(participation.id, endIso);
+}
+
+async function bootstrapEventParticipants(eventRow, guild) {
+  try {
+    const channel = await guild.channels.fetch(eventRow.channel_id);
+    if (!channel || channel.type !== ChannelType.GuildVoice) return;
+    for (const member of channel.members.values()) {
+      if (member.user?.bot) continue;
+      await startEventParticipation(eventRow, member);
+    }
+  } catch (err) {
+    console.error('Falha ao sincronizar membros do evento ativo:', err);
+  }
+}
+
+async function restoreActiveEvents(client) {
+  const rows = await db.all(`SELECT * FROM events WHERE ended_at IS NULL ORDER BY started_at ASC`);
+  const seen = new Set();
+  for (const row of rows) {
+    if (seen.has(row.guild_id)) {
+      const finished = await finalizeEvent(row, row.expected_end_at);
+      try {
+        const guild = client.guilds.cache.get(row.guild_id) ?? await client.guilds.fetch(row.guild_id);
+        if (guild) {
+          await sendEventDocToOwner(guild, finished);
+        }
+      } catch (err) {
+        console.error('Falha ao enviar relatório de evento restaurado automaticamente:', err);
+      }
+      continue;
+    }
+    seen.add(row.guild_id);
+    storeActiveEvent(row);
+    const guild = client.guilds.cache.get(row.guild_id);
+    if (guild) {
+      await bootstrapEventParticipants(row, guild);
+    }
+  }
+}
+
+function formatEventTimeLeft(eventRow) {
+  const expected = DateTime.fromISO(eventRow.expected_end_at, { zone: TIMEZONE });
+  const now = DateTime.now().setZone(TIMEZONE);
+  const minutesTotal = Math.max(0, Math.round(expected.diff(now, 'minutes').minutes));
+  if (minutesTotal <= 0) return 'encerrando agora';
+  const hours = Math.floor(minutesTotal / 60);
+  const minutes = minutesTotal % 60;
+  const parts = [];
+  if (hours) parts.push(`${hours}h`);
+  if (minutes || !parts.length) parts.push(`${minutes}min`);
+  return parts.join(' ');
+}
+
+async function buildEventReport(eventId, includeInProgress = true) {
+  const rows = await db.all(
+    `SELECT user_id, user_name, duration_minutes, joined_at
+     FROM event_participations
+     WHERE event_id=?`,
+    [eventId]
+  );
+  if (!rows.length) return [];
+
+  const totals = new Map();
+  for (const row of rows) {
+    const key = row.user_id;
+    const info = totals.get(key) ?? { name: row.user_name, minutes: 0 };
+    if (row.duration_minutes != null) {
+      info.minutes += row.duration_minutes;
+    } else if (includeInProgress) {
+      const start = toDT(row.joined_at);
+      const now = DateTime.now().setZone(TIMEZONE);
+      info.minutes += Math.max(0, Math.round(now.diff(start, 'minutes').minutes));
+    }
+    totals.set(key, info);
+  }
+
+  return [...totals.values()].sort((a, b) => b.minutes - a.minutes);
+}
+
+function formatDocDate(iso) {
+  if (!iso) return '—';
+  try {
+    return toDT(iso).toFormat('dd/LL/yyyy HH:mm');
+  } catch (err) {
+    console.error('Falha ao formatar data para relatório do evento:', err);
+    return '—';
+  }
+}
+
+async function generateEventDocData(eventRow) {
+  const report = await buildEventReport(eventRow.id, false);
+  const start = formatDocDate(eventRow.started_at);
+  const end = formatDocDate(eventRow.ended_at ?? eventRow.expected_end_at);
+  const expected = formatDocDate(eventRow.expected_end_at);
+
+  const lines = [
+    `Evento: ${eventRow.name}`,
+    `ID: ${eventRow.id}`,
+    `Sala de voz (ID): ${eventRow.channel_id}`,
+    `Início: ${start}`,
+    `Fim real: ${end}`,
+    `Fim previsto: ${expected}`,
+    '',
+    'Participantes:'
+  ];
+
+  if (report.length) {
+    report.forEach((item, idx) => {
+      lines.push(`${idx + 1}. ${item.name} — ${item.minutes} min`);
+    });
+  } else {
+    lines.push('Nenhum participante registrou presença durante o evento.');
+  }
+
+  const content = `${lines.join('\r\n')}\r\n`;
+  return {
+    buffer: Buffer.from(content, 'utf-8'),
+    filename: `relatorio_evento_${eventRow.id}.doc`,
+    participantCount: report.length
+  };
+}
+
+async function sendEventDocToOwner(guild, eventRow, docData, skipUserId = null) {
+  try {
+    const owner = await guild.fetchOwner();
+    if (!owner) return false;
+    if (skipUserId && owner.id === skipUserId) return false;
+    const data = docData ?? await generateEventDocData(eventRow);
+    const attachment = new AttachmentBuilder(data.buffer, { name: data.filename });
+    await owner.send({
+      content: `📄 Relatório final do evento **${eventRow.name}** (ID ${eventRow.id}).`,
+      files: [attachment]
+    });
+    return true;
+  } catch (err) {
+    console.error('Falha ao enviar relatório do evento ao administrador:', err);
+    return false;
+  }
+}
+
 
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -287,22 +631,25 @@ async function trySendCheckoutNotification(member) {
   const guild = member.guild;
   if (!guild) return false;
 
-  const channel = await resolveLogChannel(guild);
-  if (!channel) return false;
+  if (!canSendDm(guild.id, member.id)) {
+    return false;
+  }
 
   try {
     const row = makeCheckoutRowForUser(member.guild.id, member.id);
-    await channel.send({
+    await member.send({
       content: [
-        `👋 <@${member.id}> **Check-in iniciado!**`,
-        'Quando completar o tempo necessario, clique abaixo para fazer checkout.',
+        `👋 Olá, ${member.displayName ?? member.user?.username}!`,
+        'Seu check-in começou agora há pouco.',
+        'Quando completar o tempo necessário, clique abaixo para fazer checkout.',
         '_Se clicar antes, eu aviso quanto tempo falta._'
       ].join('\n'),
       components: [row]
     });
+    markDmSent(guild.id, member.id);
     return true;
   } catch (err) {
-    console.error('Falha ao enviar notificação de checkout no canal de log.', err);
+    console.error('Falha ao enviar DM de checkout para o usuário.', err);
     return false;
   }
 }
@@ -399,6 +746,15 @@ client.on(Events.VoiceStateUpdate, async (oldS, newS) => {
 
     const member = newS.member ?? oldS.member;
     if (!member || member.user?.bot) return;
+
+    const event = getActiveEvent(guild.id);
+    if (event) {
+      if (beforeCh !== event.channel_id && afterCh === event.channel_id) {
+        await startEventParticipation(event, member);
+      } else if (beforeCh === event.channel_id && afterCh !== event.channel_id) {
+        await stopParticipationForMember(event, member);
+      }
+    }
 
     const row = await getOpenSession(guild.id, member.id);
 
@@ -677,6 +1033,121 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    if (name === 'evento_iniciar') {
+      if (!(await ensureEventManagerPermission(interaction, 'iniciar eventos'))) {
+        return;
+      }
+      const canal = interaction.options.getChannel('sala', true);
+      if (canal.type !== ChannelType.GuildVoice) {
+        await interaction.reply({ content: '❌ Escolha uma sala de **voz** válida.', ephemeral: true });
+        return;
+      }
+      const nome = interaction.options.getString('nome', true).trim();
+      const duracao = interaction.options.getInteger('duracao_min', true);
+      if (!nome.length) {
+        await interaction.reply({ content: '❌ Informe um nome para o evento.', ephemeral: true });
+        return;
+      }
+      if (duracao <= 0) {
+        await interaction.reply({ content: '❌ A duração deve ser um número positivo de minutos.', ephemeral: true });
+        return;
+      }
+      if (getActiveEvent(interaction.guildId)) {
+        await interaction.reply({ content: '⚠️ Já existe um evento ativo. Encerre-o antes de iniciar outro.', ephemeral: true });
+        return;
+      }
+      const evento = await createEvent(interaction.guildId, canal.id, nome, duracao);
+      await bootstrapEventParticipants(evento, interaction.guild);
+      await interaction.reply({
+        content: `🎉 Evento **${nome}** iniciado!\n• ID: **${evento.id}**\n• Sala: <#${evento.channel_id}>\n• Termina em: ${formatEventTimeLeft(evento)}`,
+        ephemeral: true
+      });
+      await sendLog(interaction.guild, `🟢 **Evento iniciado** (${evento.id}): ${nome} em <#${canal.id}>`);
+      return;
+    }
+
+    if (name === 'evento_status') {
+      const evento = getActiveEvent(interaction.guildId);
+      if (!evento) {
+        await interaction.reply({ content: 'ℹ️ Nenhum evento ativo no momento.', ephemeral: true });
+        return;
+      }
+      const inicio = toDT(evento.started_at).toFormat('dd/LL HH:mm');
+      await interaction.reply({
+        content: `📊 **Evento ativo:** ${evento.name} (ID ${evento.id})\n• Sala: <#${evento.channel_id}>\n• Início: ${inicio}\n• Tempo restante: ${formatEventTimeLeft(evento)}`,
+        ephemeral: true
+      });
+      return;
+    }
+
+    if (name === 'evento_parar') {
+      if (!(await ensureEventManagerPermission(interaction, 'encerrar eventos'))) {
+        return;
+      }
+      const evento = getActiveEvent(interaction.guildId);
+      if (!evento) {
+        await interaction.reply({ content: 'ℹ️ Não há evento ativo para encerrar.', ephemeral: true });
+        return;
+      }
+      const finished = await stopActiveEvent(interaction.guildId);
+      let files;
+      let docData;
+      let extraLine = '';
+      if (finished) {
+        docData = await generateEventDocData(finished);
+        files = [new AttachmentBuilder(docData.buffer, { name: docData.filename })];
+        extraLine = docData.participantCount
+          ? '\n📄 Relatório anexado.'
+          : '\n📄 Relatório anexado (sem participações registradas).';
+      }
+      await interaction.reply({
+        content: `⏹️ Evento **${evento.name}** (ID ${evento.id}) encerrado.${extraLine}`,
+        files,
+        ephemeral: true
+      });
+      await sendLog(interaction.guild, `⏹️ **Evento encerrado** (${evento.id}): ${evento.name}`);
+      if (finished) {
+        await sendEventDocToOwner(interaction.guild, finished, docData, interaction.user.id);
+      }
+      return;
+    }
+
+    if (name === 'evento_relatorio') {
+      const requestedId = interaction.options.getInteger('id');
+      let evento;
+      if (requestedId != null) {
+        evento = await db.get(`SELECT * FROM events WHERE id=? AND guild_id=?`, [requestedId, guildKey(interaction.guildId)]);
+        if (!evento) {
+          await interaction.reply({ content: `❌ Evento com ID **${requestedId}** não encontrado.`, ephemeral: true });
+          return;
+        }
+      } else {
+        evento = getActiveEvent(interaction.guildId);
+        if (!evento) {
+          await interaction.reply({ content: 'ℹ️ Nenhum evento ativo. Informe o ID de um evento finalizado.', ephemeral: true });
+          return;
+        }
+      }
+
+      const report = await buildEventReport(evento.id, !evento.ended_at);
+      if (!report.length) {
+        await interaction.reply({ content: '📭 Nenhuma participação registrada para este evento.', ephemeral: true });
+        return;
+      }
+      const inicio = toDT(evento.started_at).toFormat('dd/LL HH:mm');
+      const fim = (evento.ended_at ? toDT(evento.ended_at) : DateTime.fromISO(evento.expected_end_at, { zone: TIMEZONE })).toFormat('dd/LL HH:mm');
+      const status = evento.ended_at ? 'Encerrado' : 'Em andamento';
+      const linhas = report.slice(0, 25).map((item, idx) => `• ${idx + 1}. **${item.name}** — ${item.minutes} min`);
+      if (report.length > 25) {
+        linhas.push(`… e mais ${report.length - 25} participantes.`);
+      }
+      await interaction.reply({
+        content: `📝 **Relatório do evento** ${evento.name} (ID ${evento.id})\n• Status: ${status}\n• Sala: <#${evento.channel_id}>\n• Início: ${inicio}\n• Fim previsto/real: ${fim}\n\n${linhas.join('\n')}`,
+        ephemeral: true
+      });
+      return;
+    }
+
   } catch (e) {
     console.error('Erro em InteractionCreate:', e);
     try { await interaction.reply({ content: '⚠️ Ocorreu um erro.', ephemeral: true }); } catch {}
@@ -686,6 +1157,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
 // ===== Ready
 client.once(Events.ClientReady, async (c) => {
   console.log(`✅ Logado como ${c.user.tag} (${c.user.id})`);
+  try {
+    await restoreActiveEvents(c);
+  } catch (err) {
+    console.error('Falha ao restaurar eventos ativos:', err);
+  }
 });
 
 // ===== Start

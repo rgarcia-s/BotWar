@@ -88,8 +88,15 @@ const commands = [
   description: '(Admin) Inicia um evento e conta tempo até o fim.',
   default_member_permissions: '0',
   options: [
-    { name: 'nome', description: 'Nome do evento', type: 3, required: true },
-    { name: 'duracao_min', description: 'Duração em minutos', type: 4, required: true }
+    {
+      name: 'sala',
+      description: 'Sala de voz que será acompanhada',
+      type: ApplicationCommandOptionType.Channel,
+      channel_types: [ChannelType.GuildVoice],
+      required: true
+    },
+    { name: 'nome', description: 'Nome do evento', type: ApplicationCommandOptionType.String, required: true },
+    { name: 'duracao_min', description: 'Duração em minutos', type: ApplicationCommandOptionType.Integer, required: true }
   ]
 },
 {
