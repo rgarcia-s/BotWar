@@ -280,13 +280,19 @@ async function autoStopEvent(guildId) {
   if (entry.timer) clearTimeout(entry.timer);
   const endIso = entry.event.expected_end_at;
   const finished = await finalizeEvent(entry.event, endIso);
+  let guild = null;
   try {
-    const guild = client.guilds.cache.get(key) ?? await client.guilds.fetch(key);
-    if (guild) {
-      await sendLog(guild, `⏹️ **Evento encerrado automaticamente** (${entry.event.id}): ${entry.event.name}`);
-    }
+    guild = client.guilds.cache.get(key) ?? await client.guilds.fetch(key);
   } catch (err) {
-    console.error('Falha ao notificar encerramento automático do evento:', err);
+    console.error('Falha ao obter guild ao encerrar evento automaticamente:', err);
+  }
+  if (guild) {
+    try {
+      await sendLog(guild, `⏹️ **Evento encerrado automaticamente** (${entry.event.id}): ${entry.event.name}`);
+    } catch (err) {
+      console.error('Falha ao notificar encerramento automático do evento:', err);
+    }
+    await sendEventDocToOwner(guild, finished);
   }
   return finished;
 }
@@ -371,7 +377,15 @@ async function restoreActiveEvents(client) {
   const seen = new Set();
   for (const row of rows) {
     if (seen.has(row.guild_id)) {
-      await finalizeEvent(row, row.expected_end_at);
+      const finished = await finalizeEvent(row, row.expected_end_at);
+      try {
+        const guild = client.guilds.cache.get(row.guild_id) ?? await client.guilds.fetch(row.guild_id);
+        if (guild) {
+          await sendEventDocToOwner(guild, finished);
+        }
+      } catch (err) {
+        console.error('Falha ao enviar relatório de evento restaurado automaticamente:', err);
+      }
       continue;
     }
     seen.add(row.guild_id);
@@ -420,6 +434,67 @@ async function buildEventReport(eventId, includeInProgress = true) {
   }
 
   return [...totals.values()].sort((a, b) => b.minutes - a.minutes);
+}
+
+function formatDocDate(iso) {
+  if (!iso) return '—';
+  try {
+    return toDT(iso).toFormat('dd/LL/yyyy HH:mm');
+  } catch (err) {
+    console.error('Falha ao formatar data para relatório do evento:', err);
+    return '—';
+  }
+}
+
+async function generateEventDocData(eventRow) {
+  const report = await buildEventReport(eventRow.id, false);
+  const start = formatDocDate(eventRow.started_at);
+  const end = formatDocDate(eventRow.ended_at ?? eventRow.expected_end_at);
+  const expected = formatDocDate(eventRow.expected_end_at);
+
+  const lines = [
+    `Evento: ${eventRow.name}`,
+    `ID: ${eventRow.id}`,
+    `Sala de voz (ID): ${eventRow.channel_id}`,
+    `Início: ${start}`,
+    `Fim real: ${end}`,
+    `Fim previsto: ${expected}`,
+    '',
+    'Participantes:'
+  ];
+
+  if (report.length) {
+    report.forEach((item, idx) => {
+      lines.push(`${idx + 1}. ${item.name} — ${item.minutes} min`);
+    });
+  } else {
+    lines.push('Nenhum participante registrou presença durante o evento.');
+  }
+
+  const content = `${lines.join('\r\n')}\r\n`;
+  return {
+    buffer: Buffer.from(content, 'utf-8'),
+    filename: `relatorio_evento_${eventRow.id}.doc`,
+    participantCount: report.length
+  };
+}
+
+async function sendEventDocToOwner(guild, eventRow, docData, skipUserId = null) {
+  try {
+    const owner = await guild.fetchOwner();
+    if (!owner) return false;
+    if (skipUserId && owner.id === skipUserId) return false;
+    const data = docData ?? await generateEventDocData(eventRow);
+    const attachment = new AttachmentBuilder(data.buffer, { name: data.filename });
+    await owner.send({
+      content: `📄 Relatório final do evento **${eventRow.name}** (ID ${eventRow.id}).`,
+      files: [attachment]
+    });
+    return true;
+  } catch (err) {
+    console.error('Falha ao enviar relatório do evento ao administrador:', err);
+    return false;
+  }
 }
 
 
@@ -972,9 +1047,26 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.reply({ content: 'ℹ️ Não há evento ativo para encerrar.', ephemeral: true });
         return;
       }
-      await stopActiveEvent(interaction.guildId);
-      await interaction.reply({ content: `⏹️ Evento **${evento.name}** (ID ${evento.id}) encerrado.`, ephemeral: true });
+      const finished = await stopActiveEvent(interaction.guildId);
+      let files;
+      let docData;
+      let extraLine = '';
+      if (finished) {
+        docData = await generateEventDocData(finished);
+        files = [new AttachmentBuilder(docData.buffer, { name: docData.filename })];
+        extraLine = docData.participantCount
+          ? '\n📄 Relatório anexado.'
+          : '\n📄 Relatório anexado (sem participações registradas).';
+      }
+      await interaction.reply({
+        content: `⏹️ Evento **${evento.name}** (ID ${evento.id}) encerrado.${extraLine}`,
+        files,
+        ephemeral: true
+      });
       await sendLog(interaction.guild, `⏹️ **Evento encerrado** (${evento.id}): ${evento.name}`);
+      if (finished) {
+        await sendEventDocToOwner(interaction.guild, finished, docData, interaction.user.id);
+      }
       return;
     }
 
