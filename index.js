@@ -7,7 +7,8 @@ import { DateTime } from 'luxon';
 const {
   DISCORD_TOKEN,
   TIMEZONE = 'America/Sao_Paulo',
-  LOG_CHANNEL_ID = '0'
+  LOG_CHANNEL_ID = '0',
+  EVENT_MANAGER_ROLE_ID
 } = process.env;
 
 if (!DISCORD_TOKEN) {
@@ -27,6 +28,49 @@ function canSendDm(guildId, userId) {
 }
 function markDmSent(guildId, userId) {
   lastDmAt.set(`${guildId}:${userId}`, new Date());
+}
+
+function memberHasRole(member, roleId) {
+  if (!member || !roleId) return false;
+  const targetId = String(roleId);
+  const roles = member.roles;
+  if (!roles) return false;
+  if (roles.cache && typeof roles.cache.has === 'function') {
+    return roles.cache.has(targetId);
+  }
+  if (typeof roles.has === 'function') {
+    try {
+      return roles.has(targetId);
+    } catch {
+      return false;
+    }
+  }
+  if (Array.isArray(roles)) {
+    return roles.includes(targetId);
+  }
+  return false;
+}
+
+async function ensureEventManagerPermission(interaction, actionDescription) {
+  const roleId = EVENT_MANAGER_ROLE_ID?.trim();
+  if (roleId) {
+    if (memberHasRole(interaction.member, roleId)) {
+      return true;
+    }
+    await interaction.reply({
+      content: `❌ Apenas membros com o cargo autorizado podem ${actionDescription}.`,
+      ephemeral: true
+    });
+    return false;
+  }
+  if (interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+    return true;
+  }
+  await interaction.reply({
+    content: '❌ Você precisa da permissão **Gerenciar Servidor**.',
+    ephemeral: true
+  });
+  return false;
 }
 
 const activeEvents = new Map(); // guildId -> { event: row, timer: Timeout | null }
@@ -990,8 +1034,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (name === 'evento_iniciar') {
-      if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
-        await interaction.reply({ content: '❌ Você precisa da permissão **Gerenciar Servidor**.', ephemeral: true });
+      if (!(await ensureEventManagerPermission(interaction, 'iniciar eventos'))) {
         return;
       }
       const canal = interaction.options.getChannel('sala', true);
@@ -1038,8 +1081,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (name === 'evento_parar') {
-      if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
-        await interaction.reply({ content: '❌ Você precisa da permissão **Gerenciar Servidor**.', ephemeral: true });
+      if (!(await ensureEventManagerPermission(interaction, 'encerrar eventos'))) {
         return;
       }
       const evento = getActiveEvent(interaction.guildId);
