@@ -287,22 +287,25 @@ async function trySendCheckoutNotification(member) {
   const guild = member.guild;
   if (!guild) return false;
 
-  const channel = await resolveLogChannel(guild);
-  if (!channel) return false;
+  if (!canSendDm(guild.id, member.id)) {
+    return false;
+  }
 
   try {
     const row = makeCheckoutRowForUser(member.guild.id, member.id);
-    await channel.send({
+    await member.send({
       content: [
-        `👋 <@${member.id}> **Check-in iniciado!**`,
-        'Quando completar o tempo necessario, clique abaixo para fazer checkout.',
+        `👋 Olá, ${member.displayName ?? member.user?.username}!`,
+        'Seu check-in começou agora há pouco.',
+        'Quando completar o tempo necessário, clique abaixo para fazer checkout.',
         '_Se clicar antes, eu aviso quanto tempo falta._'
       ].join('\n'),
       components: [row]
     });
+    markDmSent(guild.id, member.id);
     return true;
   } catch (err) {
-    console.error('Falha ao enviar notificação de checkout no canal de log.', err);
+    console.error('Falha ao enviar DM de checkout para o usuário.', err);
     return false;
   }
 }
